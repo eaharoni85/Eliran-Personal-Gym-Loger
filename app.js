@@ -54,6 +54,13 @@ const defaultState = {
     startedAt: null,
     elapsedMs: 0
   },
+  restTimer: {
+    running: false,
+    total: DEFAULT_REST_SECONDS,
+    remaining: DEFAULT_REST_SECONDS,
+    exerciseName: "",
+    endsAt: null
+  },
   workoutComplete: false,
   dailyLog: {},
   history: []
@@ -61,10 +68,12 @@ const defaultState = {
 
 let state = loadState();
 let timer = {
-  total: state.defaultRest,
-  remaining: state.defaultRest,
+  total: state.restTimer?.total || state.defaultRest,
+  remaining: getRestTimerRemaining(state.restTimer, state.defaultRest),
   intervalId: null,
-  exerciseName: ""
+  exerciseName: state.restTimer?.exerciseName || "",
+  endsAt: state.restTimer?.endsAt || null,
+  running: Boolean(state.restTimer?.running && state.restTimer?.endsAt)
 };
 
 let workoutTimerIntervalId = null;
@@ -206,6 +215,7 @@ function loadState() {
         startedAt: saved.workoutTimer?.startedAt || null,
         elapsedMs: Number(saved.workoutTimer?.elapsedMs) || 0
       },
+      restTimer: normalizeRestTimer(saved.restTimer, defaultRest),
       dailyLog: normalizeDailyLog(saved.dailyLog),
       planTemplates,
       workoutName: generateWorkoutName(saved.startedAt || new Date().toISOString(), activePlanId),
@@ -236,6 +246,23 @@ function normalizePlanTemplates(savedTemplates, activePlanId, activeExercises, d
   }
 
   return templates;
+}
+
+function normalizeRestTimer(restTimer = {}, defaultRest = DEFAULT_REST_SECONDS) {
+  const total = Number(restTimer?.total) || defaultRest;
+  const endsAt = restTimer?.endsAt || null;
+  const running = Boolean(restTimer?.running && endsAt);
+  const remaining = running
+    ? getRestTimerRemaining({ ...restTimer, total, endsAt, running }, defaultRest)
+    : Number.isFinite(Number(restTimer?.remaining)) ? Number(restTimer.remaining) : defaultRest;
+
+  return {
+    running: running && remaining > 0,
+    total,
+    remaining: Math.max(0, remaining),
+    exerciseName: restTimer?.exerciseName || "",
+    endsAt: running && remaining > 0 ? endsAt : null
+  };
 }
 
 function normalizeDailyLog(log = {}) {
@@ -310,6 +337,7 @@ function readSavedState() {
 
 function saveState() {
   persistCurrentPlanTemplate();
+  persistRestTimerState();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
@@ -707,11 +735,7 @@ function createSetForm(exercise, set, index) {
       completeWorkoutTimer();
     }
     if (metricType === "cardio") {
-      stopTimer();
-      timer.total = state.defaultRest;
-      timer.remaining = state.defaultRest;
-      timer.exerciseName = "";
-      renderTimer();
+      resetRestTimer();
     } else {
       startTimer(state.defaultRest, `${exercise.name} set ${index + 1}`);
     }
@@ -2127,12 +2151,61 @@ function syncWorkoutTimerInterval() {
   }
 }
 
+function getRestTimerRemaining(restTimer = timer, defaultRest = DEFAULT_REST_SECONDS) {
+  if (!restTimer?.running || !restTimer?.endsAt) {
+    const remaining = Number(restTimer?.remaining);
+    return Math.max(0, Number.isFinite(remaining) ? remaining : defaultRest);
+  }
+
+  return Math.max(0, Math.ceil((new Date(restTimer.endsAt).getTime() - Date.now()) / 1000));
+}
+
+function persistRestTimerState() {
+  const remaining = getRestTimerRemaining(timer, state.defaultRest);
+  state.restTimer = {
+    running: Boolean(timer.running && remaining > 0),
+    total: Number(timer.total) || state.defaultRest,
+    remaining,
+    exerciseName: timer.exerciseName || "",
+    endsAt: timer.running && remaining > 0 ? timer.endsAt : null
+  };
+}
+
+function syncRestTimerFromClock({ notify = false } = {}) {
+  const wasRunning = Boolean(timer.running);
+  const remaining = getRestTimerRemaining(timer, state.defaultRest);
+  timer.remaining = remaining;
+
+  if (wasRunning && remaining <= 0) {
+    timer.running = false;
+    timer.endsAt = null;
+    stopTimerIntervalOnly();
+    persistRestTimerState();
+    saveState();
+    if (notify) {
+      playTimerTone();
+      vibrate();
+    }
+  }
+}
+
+function syncRestTimerInterval() {
+  stopTimerIntervalOnly();
+  if (!timer.running) return;
+
+  timer.intervalId = window.setInterval(() => {
+    syncRestTimerFromClock({ notify: true });
+    renderTimer();
+  }, 1000);
+}
+
 function renderTimer() {
+  syncRestTimerFromClock();
   els.timerReadout.textContent = formatSeconds(timer.remaining);
   els.timerSubtitle.textContent = timer.exerciseName
     ? `${timer.exerciseName} rest - ${formatSeconds(timer.total)} target`
     : `Rest default is ${formatSeconds(state.defaultRest)}`;
-  els.timerToggleBtn.querySelector("span").textContent = timer.intervalId ? "II" : ">";
+  els.timerToggleBtn.querySelector("span").textContent = timer.running ? "II" : ">";
 }
 
 function emptyMessage(text) {
@@ -2145,19 +2218,15 @@ function emptyMessage(text) {
 function startTimer(seconds, exerciseName = "") {
   primeAudio();
   stopTimer();
-  timer.total = seconds || state.defaultRest;
-  timer.remaining = seconds || state.defaultRest;
+  const total = Number(seconds) || state.defaultRest;
+  timer.total = total;
+  timer.remaining = total;
   timer.exerciseName = exerciseName;
-  timer.intervalId = window.setInterval(() => {
-    timer.remaining -= 1;
-    if (timer.remaining <= 0) {
-      stopTimer();
-      timer.remaining = 0;
-      playTimerTone();
-      vibrate();
-    }
-    renderTimer();
-  }, 1000);
+  timer.endsAt = new Date(Date.now() + total * 1000).toISOString();
+  timer.running = true;
+  persistRestTimerState();
+  syncRestTimerInterval();
+  saveState();
   renderTimer();
 }
 
@@ -2206,11 +2275,55 @@ function playTimerTone() {
   });
 }
 
-function stopTimer() {
+function stopTimerIntervalOnly() {
   if (timer.intervalId) {
     window.clearInterval(timer.intervalId);
     timer.intervalId = null;
   }
+}
+
+function stopTimer() {
+  syncRestTimerFromClock();
+  stopTimerIntervalOnly();
+  timer.running = false;
+  timer.endsAt = null;
+  persistRestTimerState();
+}
+
+function resetRestTimer() {
+  stopTimerIntervalOnly();
+  timer.running = false;
+  timer.total = state.defaultRest;
+  timer.remaining = state.defaultRest;
+  timer.exerciseName = "";
+  timer.endsAt = null;
+  persistRestTimerState();
+  saveState();
+  renderTimer();
+}
+
+function loadRestTimerFromState() {
+  const restTimer = normalizeRestTimer(state.restTimer, state.defaultRest);
+  state.restTimer = restTimer;
+  stopTimerIntervalOnly();
+  timer = {
+    total: restTimer.total,
+    remaining: getRestTimerRemaining(restTimer, state.defaultRest),
+    intervalId: null,
+    exerciseName: restTimer.exerciseName || "",
+    endsAt: restTimer.endsAt || null,
+    running: Boolean(restTimer.running && restTimer.endsAt)
+  };
+  syncRestTimerFromClock();
+  syncRestTimerInterval();
+}
+
+function refreshTimersFromClock({ notify = false } = {}) {
+  syncRestTimerFromClock({ notify });
+  syncRestTimerInterval();
+  renderWorkoutTimer();
+  renderTimer();
+  saveState();
 }
 
 function vibrate() {
@@ -2258,7 +2371,7 @@ function startNewWorkout(confirmDiscard = true) {
   }
 
   persistCurrentPlanTemplate();
-  stopTimer();
+  resetRestTimer();
   resetWorkoutTimer();
   state = {
     ...state,
@@ -2268,9 +2381,6 @@ function startNewWorkout(confirmDiscard = true) {
     activeExerciseId: null,
     exercises: createExercisesFromTemplate(state.activePlanId, state.defaultRest)
   };
-  timer.remaining = state.defaultRest;
-  timer.total = state.defaultRest;
-  timer.exerciseName = "";
   saveState();
   render();
 }
@@ -2285,7 +2395,7 @@ function loadWorkoutPlan(planId) {
   }
 
   persistCurrentPlanTemplate();
-  stopTimer();
+  resetRestTimer();
   resetWorkoutTimer();
   state = {
     ...state,
@@ -2296,9 +2406,6 @@ function loadWorkoutPlan(planId) {
     activeExerciseId: null,
     exercises: createExercisesFromTemplate(planId, state.defaultRest)
   };
-  timer.remaining = state.defaultRest;
-  timer.total = state.defaultRest;
-  timer.exerciseName = "";
   saveState();
   render();
 }
@@ -2339,8 +2446,10 @@ els.workoutTimerResetBtn.addEventListener("click", resetWorkoutTimer);
 
 els.timerToggleBtn.addEventListener("click", () => {
   primeAudio();
-  if (timer.intervalId) {
+  syncRestTimerFromClock();
+  if (timer.running) {
     stopTimer();
+    saveState();
   } else {
     startTimer(timer.remaining || state.defaultRest, timer.exerciseName);
   }
@@ -2348,10 +2457,7 @@ els.timerToggleBtn.addEventListener("click", () => {
 });
 
 els.timerResetBtn.addEventListener("click", () => {
-  stopTimer();
-  timer.total = state.defaultRest;
-  timer.remaining = state.defaultRest;
-  renderTimer();
+  resetRestTimer();
 });
 
 els.addExerciseForm.addEventListener("submit", (event) => {
@@ -2389,9 +2495,10 @@ els.restDefaultSelect.addEventListener("change", (event) => {
     exercise.rest = state.defaultRest;
   });
   persistCurrentPlanTemplate();
-  timer.total = state.defaultRest;
-  if (!timer.intervalId) {
+  if (!timer.running) {
+    timer.total = state.defaultRest;
     timer.remaining = state.defaultRest;
+    persistRestTimerState();
   }
   saveState();
   render();
@@ -2421,7 +2528,13 @@ els.importInput.addEventListener("change", async (event) => {
 
   try {
     const imported = JSON.parse(await file.text());
-    state = { ...defaultState, ...imported, dailyLog: normalizeDailyLog(imported.dailyLog) };
+    state = {
+      ...defaultState,
+      ...imported,
+      restTimer: normalizeRestTimer(imported.restTimer, Number(imported.defaultRest) || DEFAULT_REST_SECONDS),
+      dailyLog: normalizeDailyLog(imported.dailyLog)
+    };
+    loadRestTimerFromState();
     saveState();
     render();
   } catch {
@@ -2435,10 +2548,8 @@ els.clearDataBtn.addEventListener("click", () => {
   if (!confirm("Clear all local data on this device/browser? This removes the current workout, workout history, reports data, remembered weights/reps, daily check-ins, bodyweight, custom exercises, edit settings, and timer state.")) return;
   localStorage.removeItem(STORAGE_KEY);
   state = structuredClone(defaultState);
-  stopTimer();
+  loadRestTimerFromState();
   resetWorkoutTimer();
-  timer.total = state.defaultRest;
-  timer.remaining = state.defaultRest;
   render();
 });
 
@@ -2448,7 +2559,18 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+window.addEventListener("focus", () => refreshTimersFromClock({ notify: true }));
+window.addEventListener("pageshow", () => refreshTimersFromClock({ notify: true }));
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    refreshTimersFromClock({ notify: true });
+  } else {
+    saveState();
+  }
+});
+window.addEventListener("pagehide", saveState);
 window.addEventListener("beforeunload", saveState);
 
 render();
 syncWorkoutTimerInterval();
+syncRestTimerInterval();
